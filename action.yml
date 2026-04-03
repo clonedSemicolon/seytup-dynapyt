@@ -1,0 +1,68 @@
+name: "Setup DynaPyt"
+description: "Instrument a Python package with DynaPyt and configure CallGraph analysis for the CI test run."
+author: "CIntent"
+branding:
+  icon: "git-merge"
+  color: "blue"
+
+inputs:
+  package:
+    description: "Python package to instrument (import name, e.g. 'grab'). If empty, instruments the workspace directory."
+    required: false
+    default: ""
+  directory:
+    description: "Directory to instrument instead of an installed package. Ignored if 'package' is set."
+    required: false
+    default: ""
+  analysis:
+    description: "DynaPyt analysis class (full dotted path)."
+    required: false
+    default: "dynapyt.analyses.CallGraph.CallGraph"
+  output:
+    description: "Path for the call graph output file."
+    required: false
+    default: "dynapyt.json"
+  dynapyt_path:
+    description: "Path to DynaPyt source to pip install from. Use a git URL or local path."
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install DynaPyt
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.dynapyt_path }}" ]; then
+          pip install "${{ inputs.dynapyt_path }}"
+        else
+          pip install "dynapyt"
+        fi
+
+    - name: Instrument and configure DynaPyt
+      shell: bash
+      run: |
+        # Resolve the target directory to instrument
+        TARGET_DIR=""
+        if [ -n "${{ inputs.package }}" ]; then
+          TARGET_DIR=$(python -c "import ${{ inputs.package }}, os; print(os.path.dirname(${{ inputs.package }}.__file__))")
+        elif [ -n "${{ inputs.directory }}" ]; then
+          TARGET_DIR="${{ inputs.directory }}"
+        else
+          TARGET_DIR="${{ github.workspace }}"
+        fi
+
+        echo "[dynapyt] Instrumenting: $TARGET_DIR"
+        python -m dynapyt.run_instrumentation \
+          --directory "$TARGET_DIR" \
+          --analysis ${{ inputs.analysis }}
+
+        # Configure the DynaPyt session so RuntimeEngine auto-activates
+        SESSION_ID=$(python -c "import uuid; print(uuid.uuid4())")
+        echo "DYNAPYT_SESSION_ID=$SESSION_ID" >> $GITHUB_ENV
+        echo "DYNAPYT_OUTPUT=${{ inputs.output }}" >> $GITHUB_ENV
+
+        TMPDIR=$(python -c "from tempfile import gettempdir; print(gettempdir())")
+        echo "${{ inputs.analysis }}" > "$TMPDIR/dynapyt_analyses-$SESSION_ID.txt"
+
+        echo "[dynapyt] Session $SESSION_ID configured. Output will be in ${{ inputs.output }}"
