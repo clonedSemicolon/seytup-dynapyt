@@ -1,17 +1,26 @@
 name: "Setup DynaPyt"
-description: "Instrument a Python package with DynaPyt and configure CallGraph analysis for the CI test run."
+description: >
+  Instrument Python code with DynaPyt and configure a session so that any
+  subsequent test run (pytest, tox, unittest, etc.) automatically triggers
+  the analysis. After tests finish, call the companion step to collect results.
 author: "CIntent"
 branding:
   icon: "git-merge"
   color: "blue"
 
+# ─────────────────────────── Inputs ────────────────────────────
 inputs:
   package:
-    description: "Python package to instrument (import name, e.g. 'grab'). If empty, instruments the workspace directory."
+    description: >
+      Python package to instrument (import name, e.g. 'grab').
+      Resolves the installed package path automatically.
+      Ignored if 'directory' is also set.
     required: false
     default: ""
   directory:
-    description: "Directory to instrument instead of an installed package. Ignored if 'package' is set."
+    description: >
+      Directory to instrument (relative to workspace root, e.g. 'src/grab').
+      Takes precedence over 'package'.
     required: false
     default: ""
   analysis:
@@ -19,17 +28,28 @@ inputs:
     required: false
     default: "dynapyt.analyses.CallGraph.CallGraph"
   output:
-    description: "Path for the call graph output file."
+    description: "Path where DynaPyt writes the final collected output."
     required: false
-    default: "dynapyt.json"
+    default: "dynapyt-output"
   dynapyt_path:
-    description: "Path to DynaPyt source to pip install from. Use a git URL or local path."
+    description: "Custom DynaPyt source to pip-install (git URL or local path). Leave empty to install from PyPI."
     required: false
     default: ""
 
+# ─────────────────────────── Outputs ───────────────────────────
+outputs:
+  session-id:
+    description: "DynaPyt session ID (needed for post-run collection)"
+    value: ${{ steps.configure.outputs.session_id }}
+  output-dir:
+    description: "Directory containing raw DynaPyt output files"
+    value: ${{ steps.configure.outputs.output_dir }}
+
+# ─────────────────────────── Steps ─────────────────────────────
 runs:
   using: "composite"
   steps:
+    # 1. Install DynaPyt + required deps
     - name: Install DynaPyt
       shell: bash
       run: |
@@ -38,31 +58,64 @@ runs:
         else
           pip install "dynapyt"
         fi
+        pip install libcst
 
-    - name: Instrument and configure DynaPyt
+    # 2. Resolve target directory and instrument
+    - name: Instrument code
       shell: bash
       run: |
-        # Resolve the target directory to instrument
         TARGET_DIR=""
-        if [ -n "${{ inputs.package }}" ]; then
-          TARGET_DIR=$(python -c "import ${{ inputs.package }}, os; print(os.path.dirname(${{ inputs.package }}.__file__))")
-        elif [ -n "${{ inputs.directory }}" ]; then
+
+        if [ -n "${{ inputs.directory }}" ]; then
           TARGET_DIR="${{ inputs.directory }}"
+        elif [ -n "${{ inputs.package }}" ]; then
+          TARGET_DIR=$(python -c "
+          import ${{ inputs.package }} as pkg, os, inspect
+          pkg_file = inspect.getfile(pkg)
+          print(os.path.dirname(os.path.abspath(pkg_file)))
+          ")
         else
-          TARGET_DIR="${{ github.workspace }}"
+          echo "::error::Either 'package' or 'directory' input must be set."
+          exit 1
+        fi
+
+        if [ ! -d "$TARGET_DIR" ]; then
+          echo "::error::Target directory '$TARGET_DIR' does not exist."
+          exit 1
         fi
 
         echo "[dynapyt] Instrumenting: $TARGET_DIR"
         python -m dynapyt.run_instrumentation \
           --directory "$TARGET_DIR" \
           --analysis ${{ inputs.analysis }}
+        echo "[dynapyt] Instrumentation complete."
 
-        # Configure the DynaPyt session so RuntimeEngine auto-activates
+    # 3. Configure DynaPyt session (env vars + analyses file)
+    #    After this step, ANY Python process that imports instrumented code
+    #    will trigger the analysis via DynaPyt's RuntimeEngine.
+    - name: Configure DynaPyt session
+      id: configure
+      shell: bash
+      run: |
         SESSION_ID=$(python -c "import uuid; print(uuid.uuid4())")
-        echo "DYNAPYT_SESSION_ID=$SESSION_ID" >> $GITHUB_ENV
-        echo "DYNAPYT_OUTPUT=${{ inputs.output }}" >> $GITHUB_ENV
-
         TMPDIR=$(python -c "from tempfile import gettempdir; print(gettempdir())")
-        echo "${{ inputs.analysis }}" > "$TMPDIR/dynapyt_analyses-$SESSION_ID.txt"
+        OUTPUT_DIR="${{ github.workspace }}/${{ inputs.output }}"
 
-        echo "[dynapyt] Session $SESSION_ID configured. Output will be in ${{ inputs.output }}"
+        mkdir -p "$OUTPUT_DIR"
+
+        # Write the analyses file in the format DynaPyt expects:
+        #   <analysis_class>;output_dir=<path>
+        echo "${{ inputs.analysis }};output_dir=${OUTPUT_DIR}" > "$TMPDIR/dynapyt_analyses-${SESSION_ID}.txt"
+
+        # Export env vars so all subsequent steps see them
+        echo "DYNAPYT_SESSION_ID=$SESSION_ID" >> "$GITHUB_ENV"
+
+        # Outputs for callers
+        echo "session_id=$SESSION_ID" >> "$GITHUB_OUTPUT"
+        echo "output_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+
+        echo "[dynapyt] Session: $SESSION_ID"
+        echo "[dynapyt] Output:  $OUTPUT_DIR"
+        echo ""
+        echo "── DynaPyt is ready. Run your tests normally in the next step. ──"
+        echo "── After tests, add the 'Collect DynaPyt results' step.        ──"

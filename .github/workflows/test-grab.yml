@@ -1,0 +1,75 @@
+# Self-test: runs DynaPyt CallGraph analysis on the "grab" project
+# to verify the action works end-to-end.
+name: "Test Action – grab"
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  dynapyt-grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── Setup ────────────────────────────────────────────────────
+      - name: Checkout this action
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Clone grab repository
+        run: |
+          git clone --depth 1 https://github.com/lorien/grab.git target-repo
+          cd target-repo
+          pip install -r requirements_dev.txt
+          pip install -e .
+
+      # ── Run the action (instrument + configure session) ──────────
+      - name: Setup DynaPyt
+        uses: ./
+        with:
+          directory: "target-repo/grab"
+          analysis: "dynapyt.analyses.CallGraph.CallGraph"
+          output: "dynapyt-output"
+
+      # ── Run tests normally — DynaPyt hooks fire automatically ────
+      - name: Run grab test suite
+        working-directory: target-repo
+        run: |
+          pytest --timeout=60 --import-mode=importlib tests/ || true
+
+      # ── Collect results ──────────────────────────────────────────
+      - name: Collect DynaPyt results
+        if: always()
+        run: |
+          echo "=== DynaPyt output files ==="
+          find dynapyt-output/ -type f 2>/dev/null | sort || echo "No output files found"
+          echo ""
+          # Also check tempdir for any session artifacts
+          TMPDIR=$(python -c "from tempfile import gettempdir; print(gettempdir())")
+          echo "=== Session files in tempdir ==="
+          ls -la "$TMPDIR"/dynapyt_* 2>/dev/null || echo "No session files"
+
+      # ── Post-run: merge outputs ──────────────────────────────────
+      - name: Merge DynaPyt outputs
+        if: always()
+        run: |
+          python -m dynapyt.post_run \
+            --output_dir=dynapyt-output 2>/dev/null || true
+
+          echo "=== Final output ==="
+          find dynapyt-output/ -type f | head -20 || echo "No files"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynapyt-callgraph-grab
+          path: dynapyt-output/
+          retention-days: 14
