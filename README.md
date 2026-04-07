@@ -158,3 +158,38 @@ Add these steps **after** your dependency installation and **before** your test 
 ```
 
 That's it — your existing test command stays the same.
+
+## Workflow Generator for DyPyBench Projects
+
+The included `generate_dynapyt_workflow.py` script can generate ready-to-use DynaPyt workflows for any of the 58 projects in [DyPyBench](https://github.com/sola-st/DyPyBench).
+
+### List all projects
+
+```bash
+python generate_dynapyt_workflow.py --list
+```
+
+### Generate a workflow file
+
+```bash
+# Generate workflow for project #1 (grab)
+python generate_dynapyt_workflow.py --project 1
+
+# Save to a specific file
+python generate_dynapyt_workflow.py --project 1 -o dynapyt.yml
+```
+
+### Fork, inject workflow, and push
+
+```bash
+# Automatically fork the repo, add the workflow, and push
+python generate_dynapyt_workflow.py --project 1 --clone --push
+```
+
+This will:
+1. Fork the project on GitHub (via `gh repo fork`)
+2. Clone your fork locally
+3. Add `.github/workflows/dynapyt.yml` with the correct source dirs, test dirs, and dependencies
+4. Commit and push
+
+Then go to **Actions** in your fork and run the workflow.
