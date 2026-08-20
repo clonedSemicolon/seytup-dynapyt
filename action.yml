@@ -1,14 +1,19 @@
 name: "Setup DynaPyt"
-description: "Install DynaPyt, instrument code, and configure analysis for CI tests."
+description: "Install DynaPyt, instrument code, run analysis during tests, and upload traces as artifacts."
 author: "CIntent"
 branding:
   icon: "git-merge"
   color: "blue"
 
 inputs:
+  mode:
+    description: "'setup' (default): install, instrument and configure the session before tests. 'collect': gather traces and upload them as an artifact after tests."
+    required: false
+    default: "setup"
   directory:
-    description: "Directory to instrument (relative to workspace root)."
-    required: true
+    description: "Directory to instrument (relative to workspace root). Required in setup mode."
+    required: false
+    default: ""
   analysis:
     description: "DynaPyt analysis class (full dotted path)."
     required: false
@@ -17,11 +22,25 @@ inputs:
     description: "Git URL or local path to install DynaPyt from. Leave empty to install from PyPI."
     required: false
     default: "git+https://github.com/sola-st/DynaPyt.git"
+  artifact-name:
+    description: "Name of the uploaded artifact (collect mode only)."
+    required: false
+    default: "dynapyt-results"
+
+outputs:
+  session-id:
+    description: "The DynaPyt session UUID (setup mode)."
+    value: ${{ steps.configure.outputs.session-id }}
+  output-dir:
+    description: "Absolute path to the trace output directory."
+    value: ${{ steps.configure.outputs.output-dir }}
 
 runs:
   using: "composite"
   steps:
+    # ──────────────────────────── setup mode ────────────────────────────
     - name: Install DynaPyt
+      if: ${{ inputs.mode == 'setup' }}
       shell: bash
       run: |
         if [ -n "${{ inputs.dynapyt_path }}" ]; then
@@ -29,43 +48,93 @@ runs:
         else
           pip install dynapyt
         fi
-        pip install libcst 2>/dev/null || true
 
-    - name: Patch CallGraph logging
+    - name: Configure DynaPyt session
+      if: ${{ inputs.mode == 'setup' }}
+      id: configure
       shell: bash
       run: |
-        CALLGRAPH=$(python -c "import dynapyt.analyses.CallGraph; print(dynapyt.analyses.CallGraph.__file__)")
+        # Replicate what dynapyt.run_analysis does before executing an entry
+        # point: pick a session id, and write the analyses file that
+        # RuntimeEngine reads (it must include ;output_dir=... so the
+        # analysis instance knows where to write its results).
+        SESSION_ID=$(python -c "import uuid; print(uuid.uuid4())")
+        TMPDIR=$(python -c "from tempfile import gettempdir; print(gettempdir())")
+        OUTPUT_DIR="$GITHUB_WORKSPACE/dynapyt-output"
+        mkdir -p "$OUTPUT_DIR"
+
+        echo "${{ inputs.analysis }};output_dir=$OUTPUT_DIR" > "$TMPDIR/dynapyt_analyses-$SESSION_ID.txt"
+
+        echo "DYNAPYT_SESSION_ID=$SESSION_ID" >> "$GITHUB_ENV"
+        echo "DYNAPYT_OUTPUT_DIR=$OUTPUT_DIR" >> "$GITHUB_ENV"
+        echo "session-id=$SESSION_ID" >> "$GITHUB_OUTPUT"
+        echo "output-dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+
+        echo "[dynapyt] Session $SESSION_ID ready."
+        echo "[dynapyt] Traces will be written to $OUTPUT_DIR"
+
+    - name: Patch built-in analyses to write traces into the output dir
+      if: ${{ inputs.mode == 'setup' }}
+      shell: bash
+      run: |
+        # CallGraph hardcodes filename="dynapyt.json" (relative to the test
+        # process CWD) and its logging.basicConfig silently no-ops when
+        # pytest already configured logging. Redirect it to the session
+        # output dir and force reconfiguration.
+        CALLGRAPH=$(python -c "import dynapyt.analyses.CallGraph as m; print(m.__file__)")
         if grep -q 'logging.basicConfig(' "$CALLGRAPH" && ! grep -q 'force=True' "$CALLGRAPH"; then
           sed -i 's/logging.basicConfig(/logging.basicConfig(force=True, /' "$CALLGRAPH"
           echo "[dynapyt] Patched CallGraph with force=True"
         fi
+        if grep -q 'filename="dynapyt.json"' "$CALLGRAPH"; then
+          sed -i 's|filename="dynapyt.json"|filename=os.path.join(os.environ.get("DYNAPYT_OUTPUT_DIR", "."), "dynapyt.json")|' "$CALLGRAPH"
+          echo "[dynapyt] Patched CallGraph to write into DYNAPYT_OUTPUT_DIR"
+        fi
+
+        # TraceAll hardcodes FileHandler("output.log") — same treatment.
+        TRACEALL=$(python -c "import dynapyt.analyses.TraceAll as m; print(m.__file__)")
+        if grep -q 'logging.FileHandler("output.log"' "$TRACEALL"; then
+          sed -i 's|logging.FileHandler("output.log"|logging.FileHandler(os.path.join(os.environ.get("DYNAPYT_OUTPUT_DIR", "."), "output.log")|' "$TRACEALL"
+          grep -q '^import os' "$TRACEALL" || sed -i '1i import os' "$TRACEALL"
+          echo "[dynapyt] Patched TraceAll to write into DYNAPYT_OUTPUT_DIR"
+        fi
 
     - name: Instrument
+      if: ${{ inputs.mode == 'setup' }}
       shell: bash
       run: |
         python -m dynapyt.run_instrumentation \
           --directory "${{ inputs.directory }}" \
-          --analysis ${{ inputs.analysis }}
+          --analysis "${{ inputs.analysis }}"
 
-    - name: Configure DynaPyt session
+    # ─────────────────────────── collect mode ───────────────────────────
+    - name: Collect DynaPyt traces
+      if: ${{ inputs.mode == 'collect' }}
+      id: gather
       shell: bash
       run: |
-        # Pre-configure the DynaPyt session.
-        # When the instrumented code is imported during tests, RuntimeEngine
-        # reads DYNAPYT_SESSION_ID and loads the analysis from the temp file.
-        # The analysis hooks fire automatically. On process exit, atexit calls
-        # end_execution() which writes dynapyt.json to the working directory.
-        SESSION_ID=$(python -c "import uuid; print(uuid.uuid4())")
-        TMPDIR=$(python -c "from tempfile import gettempdir; print(gettempdir())")
-        echo "${{ inputs.analysis }}" > "$TMPDIR/dynapyt_analyses-$SESSION_ID.txt"
+        OUTPUT_DIR="${DYNAPYT_OUTPUT_DIR:-$GITHUB_WORKSPACE/dynapyt-output}"
+        mkdir -p "$OUTPUT_DIR"
 
-        echo "DYNAPYT_SESSION_ID=$SESSION_ID" >> "$GITHUB_ENV"
-        echo "DYNAPYT_ANALYSIS=${{ inputs.analysis }}" >> "$GITHUB_ENV"
+        # Merge per-process output-*.json files (same as dynapyt.post_run).
+        python -c "from pathlib import Path; from dynapyt.utils.runtimeUtils import gather_output; gather_output(Path('$OUTPUT_DIR'))" || true
 
-        DYNAPYT_LOGS=/home/runner/dynapyt/log
-        mkdir -p "$DYNAPYT_LOGS"
-        echo "DYNAPYT_LOGS=$DYNAPYT_LOGS" >> "$GITHUB_ENV"
+        # Pick up traces written to the working directory by analyses that
+        # ignore output_dir (unpatched CallGraph/TraceAll, custom analyses).
+        for f in dynapyt.json output.log; do
+          if [ -f "$f" ] && [ ! -f "$OUTPUT_DIR/$f" ]; then
+            cp "$f" "$OUTPUT_DIR/"
+          fi
+        done
 
-        echo "[dynapyt] Session $SESSION_ID ready."
-        echo "[dynapyt] Just run your tests — instrumented code will trigger the analysis."
-        echo "[dynapyt] Output: dynapyt.json (in working directory)"
+        echo "output-dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+        echo "=== Collected trace files ==="
+        ls -la "$OUTPUT_DIR"
+
+    - name: Upload traces as artifact
+      if: ${{ inputs.mode == 'collect' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.gather.outputs.output-dir }}
+        if-no-files-found: warn

@@ -1,21 +1,23 @@
 # Setup DynaPyt — GitHub Action
 
-A composite GitHub Action that instruments Python code with [DynaPyt](https://github.com/sola-st/DynaPyt) and configures a session so that **any subsequent test step** automatically triggers dynamic analysis.
+A composite GitHub Action that instruments Python code with [DynaPyt](https://github.com/sola-st/DynaPyt) and configures a session so that **any subsequent test step** automatically triggers dynamic analysis. Used a second time with `mode: collect`, it gathers the traces and uploads them as a workflow artifact.
 
 ## How it works
 
 ```
-┌─────────────────────┐     ┌──────────────────────┐     ┌──────────────────┐
-│  1. Setup DynaPyt   │ ──▶ │  2. Run your tests   │ ──▶ │  3. Collect      │
-│  (this action)      │     │  (pytest/tox/etc.)   │     │  results         │
-│                     │     │                      │     │                  │
-│  • Install DynaPyt  │     │  Tests import the    │     │  • post_run      │
-│  • Instrument code  │     │  instrumented code → │     │  • upload-       │
-│  • Set session env  │     │  hooks fire → traces │     │    artifact      │
-└─────────────────────┘     └──────────────────────┘     └──────────────────┘
+┌─────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
+│  1. Setup DynaPyt   │ ──▶ │  2. Run your tests   │ ──▶ │  3. Collect DynaPyt  │
+│  (mode: setup)      │     │  (pytest/tox/etc.)   │     │  (mode: collect)     │
+│                     │     │                      │     │                      │
+│  • Install DynaPyt  │     │  Tests import the    │     │  • merge traces      │
+│  • Instrument code  │     │  instrumented code → │     │  • upload artifact   │
+│  • Set session env  │     │  hooks fire → traces │     │                      │
+└─────────────────────┘     └──────────────────────┘     └──────────────────────┘
 ```
 
 DynaPyt **rewrites your source files** with instrumentation hooks. When any Python process imports that code, DynaPyt's `RuntimeEngine` detects the `DYNAPYT_SESSION_ID` env var, loads the configured analysis, and starts tracing. This means your existing test commands work unchanged.
+
+The setup mode writes the session's analyses file with `output_dir` pointing at `$GITHUB_WORKSPACE/dynapyt-output` (exposed as `$DYNAPYT_OUTPUT_DIR`), and patches the built-in `CallGraph`/`TraceAll` analyses so their trace files (`dynapyt.json`, `output.log`) land in that directory instead of the test process's working directory. The collect mode merges any per-process `output-*.json` files and uploads the whole directory as an artifact.
 
 ## Usage
 
@@ -40,25 +42,12 @@ steps:
   - name: Run tests
     run: pytest tests/
 
-  - name: Collect results
+  - name: Collect & upload DynaPyt traces
     if: always()
-    run: python -m dynapyt.post_run --output_dir=dynapyt-output || true
-
-  - uses: actions/upload-artifact@v4
-    if: always()
-    with:
-      name: dynapyt-results
-      path: dynapyt-output/
-```
-
-### Instrument an installed package by name
-
-```yaml
-  - name: Setup DynaPyt
     uses: clonedSemicolon/seytup-dynapyt@master
     with:
-      package: "grab"
-      analysis: "dynapyt.analyses.TraceAll.TraceAll"
+      mode: collect
+      artifact-name: dynapyt-results
 ```
 
 ### Using with grab
@@ -78,35 +67,30 @@ steps:
   - name: Run tests
     run: pytest --timeout=60 --import-mode=importlib tests/ || true
 
-  - name: Merge & upload
+  - name: Collect & upload DynaPyt traces
     if: always()
-    run: python -m dynapyt.post_run --output_dir=dynapyt-output || true
-
-  - uses: actions/upload-artifact@v4
-    if: always()
+    uses: clonedSemicolon/seytup-dynapyt@master
     with:
-      name: dynapyt-callgraph
-      path: dynapyt-output/
+      mode: collect
+      artifact-name: dynapyt-callgraph
 ```
 
 ## Inputs
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `directory` | no | `""` | Directory to instrument (relative to workspace). **Takes precedence over `package`.** |
-| `package` | no | `""` | Installed Python package name to instrument (e.g. `grab`). Resolves path automatically. |
+| `mode` | no | `setup` | `setup` installs/instruments/configures before tests; `collect` gathers traces and uploads the artifact after tests |
+| `directory` | in setup mode | `""` | Directory to instrument (relative to workspace) |
 | `analysis` | no | `dynapyt.analyses.CallGraph.CallGraph` | DynaPyt analysis class (full dotted path) |
-| `output` | no | `dynapyt-output` | Directory for DynaPyt output files |
-| `dynapyt_path` | no | `""` | Custom DynaPyt install source (git URL or local path) |
-
-> **Note:** Either `directory` or `package` must be provided.
+| `dynapyt_path` | no | DynaPyt git repo | Custom DynaPyt install source (git URL or local path). Empty = PyPI |
+| `artifact-name` | no | `dynapyt-results` | Artifact name (collect mode only) |
 
 ## Outputs
 
 | Output | Description |
 |--------|-------------|
-| `session-id` | The DynaPyt session UUID |
-| `output-dir` | Absolute path to the output directory |
+| `session-id` | The DynaPyt session UUID (setup mode) |
+| `output-dir` | Absolute path to the trace output directory |
 
 ### Using outputs
 
@@ -121,18 +105,20 @@ steps:
     run: echo "Session ID: ${{ steps.dynapyt.outputs.session-id }}"
 ```
 
+The setup mode also exports `DYNAPYT_SESSION_ID` and `DYNAPYT_OUTPUT_DIR` to the job environment, so later steps can use them directly.
+
 ## Available analyses
 
-| Analysis | Dotted path | Description |
-|----------|-------------|-------------|
-| CallGraph | `dynapyt.analyses.CallGraph.CallGraph` | Dynamic call graph |
-| TraceAll | `dynapyt.analyses.TraceAll.TraceAll` | Full execution trace |
+| Analysis | Dotted path | Trace file |
+|----------|-------------|------------|
+| CallGraph | `dynapyt.analyses.CallGraph.CallGraph` | `dynapyt.json` |
+| TraceAll | `dynapyt.analyses.TraceAll.TraceAll` | `output.log` |
 
-See the [DynaPyt analyses folder](https://github.com/sola-st/DynaPyt/tree/main/src/dynapyt/analyses) for all built-in analyses, or implement your own.
+See the [DynaPyt analyses folder](https://github.com/sola-st/DynaPyt/tree/main/src/dynapyt/analyses) for all built-in analyses, or implement your own. Custom analyses receive `output_dir` (pointing at `$DYNAPYT_OUTPUT_DIR`) via their constructor; any `output-*.json` they write there is merged into `output.json` by the collect mode.
 
 ## How to add to an existing CI workflow
 
-Add these steps **after** your dependency installation and **before** your test step:
+Add one step **after** your dependency installation and **before** your test step, and one step **after** your test step:
 
 ```yaml
   # Add this BEFORE your test step
@@ -146,15 +132,11 @@ Add these steps **after** your dependency installation and **before** your test 
     run: pytest tests/
 
   # Add this AFTER your test step
-  - name: Collect DynaPyt output
+  - name: Collect & upload DynaPyt traces
     if: always()
-    run: python -m dynapyt.post_run --output_dir=dynapyt-output || true
-
-  - uses: actions/upload-artifact@v4
-    if: always()
+    uses: clonedSemicolon/seytup-dynapyt@master
     with:
-      name: dynapyt-results
-      path: dynapyt-output/
+      mode: collect
 ```
 
 That's it — your existing test command stays the same.

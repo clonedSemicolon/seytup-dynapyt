@@ -229,20 +229,12 @@ jobs:
         run: |
           pytest --timeout=120 --import-mode=importlib {test_dir} || true
 
-      - name: Collect DynaPyt output
+      - name: Collect & upload DynaPyt traces
         if: always()
-        run: |
-          python -m dynapyt.post_run --output_dir=dynapyt-output 2>/dev/null || true
-          echo "=== DynaPyt output files ==="
-          find dynapyt-output/ -type f 2>/dev/null | head -50 || echo "No output files"
-
-      - name: Upload DynaPyt artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
+        uses: clonedSemicolon/seytup-dynapyt@master
         with:
-          name: dynapyt-{name}
-          path: dynapyt-output/
-          retention-days: 30
+          mode: collect
+          artifact-name: dynapyt-{name}
 """
     return workflow, name, url
 
