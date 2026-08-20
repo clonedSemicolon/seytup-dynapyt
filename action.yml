@@ -1,5 +1,5 @@
-name: "Setup DynaPyt"
-description: "Install DynaPyt, instrument code, run analysis during tests, and upload traces as artifacts."
+name: "Trace Python with DynaPyt"
+description: "Trace Python calls across selected GitHub Actions steps and upload the combined job trace."
 author: "CIntent"
 branding:
   icon: "git-merge"
@@ -7,15 +7,19 @@ branding:
 
 inputs:
   mode:
-    description: "'setup' (default): install, instrument and configure the session before tests. 'collect': gather traces and upload them as an artifact after tests."
+    description: "'setup' (default): install, instrument targets, and configure a job-wide session. 'collect': gather traces and upload them as one artifact."
     required: false
     default: "setup"
+  targets:
+    description: "Optional newline-separated targets. Each line is directory:<path>, package:<import-name>, or file:<path>. Takes precedence over directory/package."
+    required: false
+    default: ""
   directory:
-    description: "Directory to instrument (relative to workspace root). Setup mode requires either this or 'package'."
+    description: "Legacy single directory target (relative to workspace root). Ignored when targets is set."
     required: false
     default: ""
   package:
-    description: "Installed Python package name to instrument (e.g. 'grab'). Resolves to the location your tests actually import (e.g. site-packages after a wheel install). Ignored if 'directory' is set."
+    description: "Legacy single installed-package target (the Python import name). Ignored when targets or directory is set."
     required: false
     default: ""
   analysis:
@@ -30,6 +34,10 @@ inputs:
     description: "Name of the uploaded artifact (collect mode only)."
     required: false
     default: "dynapyt-results"
+  fail-on-empty:
+    description: "Fail setup when no Python files were instrumented. Set to 'false' to emit only a warning."
+    required: false
+    default: "true"
 
 outputs:
   session-id:
@@ -103,31 +111,17 @@ runs:
           echo "[dynapyt] Patched TraceAll to write into DYNAPYT_OUTPUT_DIR"
         fi
 
-    - name: Instrument
+    - name: Instrument targets
       if: ${{ inputs.mode == 'setup' }}
       shell: bash
+      env:
+        DYNAPYT_TARGETS_INPUT: ${{ inputs.targets }}
+        DYNAPYT_DIRECTORY_INPUT: ${{ inputs.directory }}
+        DYNAPYT_PACKAGE_INPUT: ${{ inputs.package }}
+        DYNAPYT_ANALYSIS_INPUT: ${{ inputs.analysis }}
+        DYNAPYT_FAIL_ON_EMPTY_INPUT: ${{ inputs.fail-on-empty }}
       run: |
-        TARGET="${{ inputs.directory }}"
-        if [ -z "$TARGET" ] && [ -n "${{ inputs.package }}" ]; then
-          # Resolve the location the tests will actually import from
-          # (e.g. site-packages when the project is installed as a wheel).
-          TARGET=$(python -c "import importlib.util; s = importlib.util.find_spec('${{ inputs.package }}'); print(s.submodule_search_locations[0] if s.submodule_search_locations else s.origin)") || TARGET=""
-          echo "[dynapyt] Resolved package '${{ inputs.package }}' to ${TARGET:-<not importable>}"
-        fi
-        if [ -z "$TARGET" ]; then
-          echo "::error::Setup mode needs either the 'directory' or 'package' input."
-          exit 1
-        fi
-
-        python -m dynapyt.run_instrumentation \
-          --directory "$TARGET" \
-          --analysis "${{ inputs.analysis }}"
-
-        N_INSTRUMENTED=$(find "$TARGET" -name "*.py.orig" | wc -l)
-        echo "[dynapyt] Instrumented $N_INSTRUMENTED files in $TARGET"
-        if [ "$N_INSTRUMENTED" -eq 0 ]; then
-          echo "::warning::No files were instrumented in '$TARGET' — no traces will be produced."
-        fi
+        python "$GITHUB_ACTION_PATH/scripts/instrument_targets.py"
 
     # ─────────────────────────── collect mode ───────────────────────────
     - name: Collect DynaPyt traces
@@ -160,7 +154,12 @@ runs:
         [ -s "$OUTPUT_DIR/output.log" ] && HAS_TRACE=1
         [ "$(cat "$OUTPUT_DIR/output.json" 2>/dev/null)" != "[]" ] && [ -s "$OUTPUT_DIR/output.json" ] && HAS_TRACE=1
         if [ "$HAS_TRACE" -eq 0 ]; then
-          echo "::warning::All DynaPyt traces are empty. Your tests never imported the instrumented code. If the project is installed as a wheel before testing, instrument the installed copy with the 'package' input instead of 'directory'."
+          echo "::warning::All DynaPyt traces are empty. The workflow did not execute the instrumented Python targets."
+        fi
+
+        TMPDIR=$(python -c "from tempfile import gettempdir; print(gettempdir())")
+        if [ -n "${DYNAPYT_SESSION_ID:-}" ]; then
+          rm -f "$TMPDIR/dynapyt_analyses-$DYNAPYT_SESSION_ID.txt"
         fi
 
     - name: Upload traces as artifact
