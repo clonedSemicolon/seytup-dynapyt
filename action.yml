@@ -11,7 +11,11 @@ inputs:
     required: false
     default: "setup"
   directory:
-    description: "Directory to instrument (relative to workspace root). Required in setup mode."
+    description: "Directory to instrument (relative to workspace root). Setup mode requires either this or 'package'."
+    required: false
+    default: ""
+  package:
+    description: "Installed Python package name to instrument (e.g. 'grab'). Resolves to the location your tests actually import (e.g. site-packages after a wheel install). Ignored if 'directory' is set."
     required: false
     default: ""
   analysis:
@@ -103,9 +107,27 @@ runs:
       if: ${{ inputs.mode == 'setup' }}
       shell: bash
       run: |
+        TARGET="${{ inputs.directory }}"
+        if [ -z "$TARGET" ] && [ -n "${{ inputs.package }}" ]; then
+          # Resolve the location the tests will actually import from
+          # (e.g. site-packages when the project is installed as a wheel).
+          TARGET=$(python -c "import importlib.util; s = importlib.util.find_spec('${{ inputs.package }}'); print(s.submodule_search_locations[0] if s.submodule_search_locations else s.origin)") || TARGET=""
+          echo "[dynapyt] Resolved package '${{ inputs.package }}' to ${TARGET:-<not importable>}"
+        fi
+        if [ -z "$TARGET" ]; then
+          echo "::error::Setup mode needs either the 'directory' or 'package' input."
+          exit 1
+        fi
+
         python -m dynapyt.run_instrumentation \
-          --directory "${{ inputs.directory }}" \
+          --directory "$TARGET" \
           --analysis "${{ inputs.analysis }}"
+
+        N_INSTRUMENTED=$(find "$TARGET" -name "*.py.orig" | wc -l)
+        echo "[dynapyt] Instrumented $N_INSTRUMENTED files in $TARGET"
+        if [ "$N_INSTRUMENTED" -eq 0 ]; then
+          echo "::warning::No files were instrumented in '$TARGET' — no traces will be produced."
+        fi
 
     # ─────────────────────────── collect mode ───────────────────────────
     - name: Collect DynaPyt traces
@@ -130,6 +152,16 @@ runs:
         echo "output-dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
         echo "=== Collected trace files ==="
         ls -la "$OUTPUT_DIR"
+
+        # An empty dynapyt.json and an output.json of '[]' means no hook ever
+        # fired: the instrumented directory was never imported by the tests.
+        HAS_TRACE=0
+        [ -s "$OUTPUT_DIR/dynapyt.json" ] && HAS_TRACE=1
+        [ -s "$OUTPUT_DIR/output.log" ] && HAS_TRACE=1
+        [ "$(cat "$OUTPUT_DIR/output.json" 2>/dev/null)" != "[]" ] && [ -s "$OUTPUT_DIR/output.json" ] && HAS_TRACE=1
+        if [ "$HAS_TRACE" -eq 0 ]; then
+          echo "::warning::All DynaPyt traces are empty. Your tests never imported the instrumented code. If the project is installed as a wheel before testing, instrument the installed copy with the 'package' input instead of 'directory'."
+        fi
 
     - name: Upload traces as artifact
       if: ${{ inputs.mode == 'collect' }}

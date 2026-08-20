@@ -21,6 +21,18 @@ The setup mode writes the session's analyses file with `output_dir` pointing at 
 
 ## Usage
 
+### Which input do I use: `directory` or `package`?
+
+The only rule that matters, for **any** project: instrument the copy of the code your tests will *import*.
+
+| How the project is set up before tests | What to use |
+|-----------------------------------------|-------------|
+| `pip install -e .` (editable) or imported straight from the repo | `directory: "path/to/source"` |
+| `pip install .` or a built wheel/sdist (code copied to site-packages) | `package: "import_name"` |
+| Not sure | `package: "import_name"` — it always resolves to whatever `import` would load |
+
+Everything else (analysis choice, collection, artifact upload) is identical regardless of project.
+
 ### Basic example (instrument a directory)
 
 ```yaml
@@ -50,22 +62,24 @@ steps:
       artifact-name: dynapyt-results
 ```
 
-### Using with grab
+### Example: project installed as a wheel before testing
+
+Some CI workflows build and install the package (e.g. `make build` + `pip install dist/*.whl`, or plain `pip install .`) instead of using an editable install. Tests then import the copy in **site-packages**, so instrumenting the source tree in the workspace produces empty traces. Use `package` and the action resolves the installed location automatically:
 
 ```yaml
-  - name: Install grab
+  - name: Build wheel and install
     run: |
-      pip install -r requirements_dev.txt
-      pip install -e .
+      python -m build
+      pip install dist/*.whl
 
   - name: Setup DynaPyt
     uses: clonedSemicolon/seytup-dynapyt@master
     with:
-      directory: "grab"
+      package: "mypackage"    # the name you `import`, not the PyPI name
       analysis: "dynapyt.analyses.CallGraph.CallGraph"
 
   - name: Run tests
-    run: pytest --timeout=60 --import-mode=importlib tests/ || true
+    run: pytest tests/ || true
 
   - name: Collect & upload DynaPyt traces
     if: always()
@@ -80,10 +94,13 @@ steps:
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `mode` | no | `setup` | `setup` installs/instruments/configures before tests; `collect` gathers traces and uploads the artifact after tests |
-| `directory` | in setup mode | `""` | Directory to instrument (relative to workspace) |
+| `directory` | no* | `""` | Directory to instrument (relative to workspace) |
+| `package` | no* | `""` | Installed package name to instrument (the name you `import`). Resolves the import location automatically — use this when the project is installed non-editably (wheel, sdist, `pip install .`). Ignored if `directory` is set |
 | `analysis` | no | `dynapyt.analyses.CallGraph.CallGraph` | DynaPyt analysis class (full dotted path) |
 | `dynapyt_path` | no | DynaPyt git repo | Custom DynaPyt install source (git URL or local path). Empty = PyPI |
 | `artifact-name` | no | `dynapyt-results` | Artifact name (collect mode only) |
+
+\* Setup mode requires either `directory` or `package`.
 
 ## Outputs
 
