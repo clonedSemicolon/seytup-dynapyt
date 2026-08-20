@@ -3,9 +3,20 @@ name: Self-test
 on:
   push:
     branches: [master, main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
+  helper-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Test target resolution helper
+        run: python -m unittest discover -s tests -v
+
   # ───────────────────────────────────────────────────────────────────
   # Scenario 1: tests import the source tree directly (directory input)
   # ───────────────────────────────────────────────────────────────────
@@ -159,3 +170,77 @@ jobs:
           fi
           echo "OK — trace contains instrumented calls:"
           head -c 500 "$FILE"; echo
+
+  # ───────────────────────────────────────────────────────────────────
+  # Scenario 3: one session instruments multiple target kinds
+  # ───────────────────────────────────────────────────────────────────
+  multi-target-mode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Create multiple Python targets
+        run: |
+          mkdir -p pkg_one pkg_two tests
+          cat > pkg_one/__init__.py <<'EOF'
+          def helper_one():
+              return "one"
+
+          def run():
+              return helper_one()
+          EOF
+          cat > pkg_two/__init__.py <<'EOF'
+          def helper_two():
+              return "two"
+
+          def run():
+              return helper_two()
+          EOF
+          cat > standalone.py <<'EOF'
+          def inner():
+              return "standalone"
+
+          def outer():
+              return inner()
+          EOF
+          cat > tests/test_targets.py <<'EOF'
+          import pkg_one
+          import pkg_two
+          import standalone
+
+          def test_all_targets():
+              assert pkg_one.run() == "one"
+              assert pkg_two.run() == "two"
+              assert standalone.outer() == "standalone"
+          EOF
+          pip install pytest
+
+      - name: Setup DynaPyt for all targets
+        uses: ./
+        with:
+          targets: |
+            directory:pkg_one
+            package:pkg_two
+            file:standalone.py
+
+      - name: Run all instrumented targets
+        run: pytest tests/
+
+      - name: Collect & upload combined trace
+        if: always()
+        uses: ./
+        with:
+          mode: collect
+          artifact-name: selftest-multi-target-callgraph
+
+      - name: Verify combined trace
+        run: |
+          FILE="$DYNAPYT_OUTPUT_DIR/dynapyt.json"
+          test -s "$FILE"
+          grep -q "helper_one" "$FILE"
+          grep -q "helper_two" "$FILE"
+          grep -q "inner" "$FILE"

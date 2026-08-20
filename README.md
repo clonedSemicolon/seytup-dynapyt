@@ -33,6 +33,60 @@ The only rule that matters, for **any** project: instrument the copy of the code
 
 Everything else (analysis choice, collection, artifact upload) is identical regardless of project.
 
+### Trace several Python steps with two workflow changes
+
+Start one session before the Python steps you care about and collect once at
+the end of the job. The `targets` input accepts multiple source types under
+the same session:
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+  - uses: actions/setup-python@v5
+    with:
+      python-version: "3.11"
+
+  # Added step 1: instrument every Python target needed by later steps.
+  - name: Start job-wide DynaPyt trace
+    uses: clonedSemicolon/seytup-dynapyt@master
+    with:
+      targets: |
+        package:pip
+        directory:src
+        file:scripts/release_check.py
+      analysis: dynapyt.analyses.CallGraph.CallGraph
+
+  # Existing workflow steps remain unchanged.
+  - name: Install dependencies
+    run: python -m pip install -r requirements.txt
+
+  - name: Run tests
+    run: python -m pytest
+
+  - name: Release check
+    run: python scripts/release_check.py
+
+  # Added step 2: merge and upload one artifact for this job.
+  - name: Collect DynaPyt traces
+    if: always()
+    uses: clonedSemicolon/seytup-dynapyt@master
+    with:
+      mode: collect
+      artifact-name: dynapyt-${{ github.run_id }}-${{ github.job }}
+```
+
+Target prefixes have precise meanings:
+
+- `directory:<path>` recursively instruments Python files in a source directory.
+- `package:<name>` instruments the source resolved by that Python import name.
+- `file:<path>` instruments one Python file.
+
+`package:pip` traces Python calls inside the dependency-installation step.
+`directory:src` traces calls from an editable/source-tree application during
+later tests. DynaPyt observes only instrumented Python code; it does not trace
+shell commands, JavaScript actions, or GitHub's runner orchestration.
+
+
 ### Basic example (instrument a directory)
 
 ```yaml
@@ -79,7 +133,7 @@ Some CI workflows build and install the package (e.g. `make build` + `pip instal
       analysis: "dynapyt.analyses.CallGraph.CallGraph"
 
   - name: Run tests
-    run: pytest tests/ || true
+    run: pytest tests/
 
   - name: Collect & upload DynaPyt traces
     if: always()
@@ -93,14 +147,16 @@ Some CI workflows build and install the package (e.g. `make build` + `pip instal
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `mode` | no | `setup` | `setup` installs/instruments/configures before tests; `collect` gathers traces and uploads the artifact after tests |
-| `directory` | no* | `""` | Directory to instrument (relative to workspace) |
-| `package` | no* | `""` | Installed package name to instrument (the name you `import`). Resolves the import location automatically — use this when the project is installed non-editably (wheel, sdist, `pip install .`). Ignored if `directory` is set |
+| `mode` | no | `setup` | `setup` installs/instruments/configures before Python steps; `collect` gathers traces and uploads one job artifact |
+| `targets` | no* | `""` | Newline-separated `directory:`, `package:`, or `file:` targets. Takes precedence over the legacy single-target inputs |
+| `directory` | no* | `""` | Legacy single directory target (relative to workspace) |
+| `package` | no* | `""` | Legacy single installed-package target using its Python import name |
 | `analysis` | no | `dynapyt.analyses.CallGraph.CallGraph` | DynaPyt analysis class (full dotted path) |
 | `dynapyt_path` | no | DynaPyt git repo | Custom DynaPyt install source (git URL or local path). Empty = PyPI |
 | `artifact-name` | no | `dynapyt-results` | Artifact name (collect mode only) |
+| `fail-on-empty` | no | `true` | Fail setup if none of the selected targets produced instrumented files |
 
-\* Setup mode requires either `directory` or `package`.
+\* Setup mode requires `targets`, `directory`, or `package`.
 
 ## Outputs
 
@@ -157,6 +213,37 @@ Add one step **after** your dependency installation and **before** your test ste
 ```
 
 That's it — your existing test command stays the same.
+
+## Combine traces from multiple jobs
+
+GitHub jobs run on isolated runners, so start/collect once in every Python job
+and give each artifact a unique name such as
+`dynapyt-${{ github.run_id }}-${{ github.job }}`. A final job can bundle them:
+
+```yaml
+  dynapyt-bundle:
+    if: ${{ always() }}
+    needs: [test, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download job traces
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dynapyt-${{ github.run_id }}-*
+          path: dynapyt-all
+          merge-multiple: false
+
+      - name: Upload one workflow trace bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynapyt-workflow-${{ github.run_id }}
+          path: dynapyt-all/
+```
+
+List every traced job in `needs`. The downloaded artifact directories remain
+separate, preventing identically named files such as `dynapyt.json` from
+overwriting one another.
+
 
 ## Workflow Generator for DyPyBench Projects
 
